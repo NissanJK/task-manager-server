@@ -1,25 +1,16 @@
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-const http = require("http");
-const { Server } = require("socket.io");
 require("dotenv").config();
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: "https://task-manager-a8537.web.app",
-        methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
-    },
-});
-
 const port = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
+// MongoDB Connection
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.rw4nz.mongodb.net/taskManager?retryWrites=true&w=majority`;
 
 const client = new MongoClient(uri, {
@@ -32,7 +23,6 @@ const client = new MongoClient(uri, {
 
 let db, tasksCollection, usersCollection;
 
-// Connect to MongoDB
 async function connectDB() {
     try {
         await client.connect();
@@ -46,54 +36,6 @@ async function connectDB() {
         process.exit(1);
     }
 }
-
-// WebSocket Handling
-io.on("connection", (socket) => {
-    console.log("A user connected:", socket.id);
-
-    socket.on("getTasks", async (userId) => {
-        const tasks = await tasksCollection.find({ userId }).toArray();
-        socket.emit("tasks", tasks);
-    });
-
-    socket.on("addTask", async (task) => {
-        const newTask = { ...task, _id: new ObjectId() };
-        await tasksCollection.insertOne(newTask);
-        io.emit("taskAdded", newTask);
-    });
-
-    socket.on("updateTask", async (updatedTask) => {
-        const { _id, ...rest } = updatedTask;
-        await tasksCollection.updateOne({ _id: new ObjectId(_id) }, { $set: rest });
-        io.emit("taskUpdated", updatedTask);
-    });
-
-    socket.on("updateTaskStatus", async ({ _id, status }) => {
-        try {
-            await tasksCollection.updateOne(
-                { _id: new ObjectId(_id) },
-                { $set: { status } }
-            );
-    
-            // Fetch the updated task list from the database
-            const updatedTasks = await tasksCollection.find({}).toArray();
-    
-            // Emit the full updated task list to all clients
-            io.emit("tasks", updatedTasks);
-        } catch (error) {
-            console.error("Error updating task status:", error);
-        }
-    });
-
-    socket.on("deleteTask", async (taskId) => {
-        await tasksCollection.deleteOne({ _id: new ObjectId(taskId) });
-        io.emit("taskDeleted", taskId);
-    });
-
-    socket.on("disconnect", () => {
-        console.log("A user disconnected:", socket.id);
-    });
-});
 
 // User Routes
 app.post("/api/users", async (req, res) => {
@@ -125,12 +67,27 @@ app.get("/api/users/:uid", async (req, res) => {
 // Task Routes
 app.post("/api/tasks", async (req, res) => {
     try {
-        const { title, status, userId } = req.body;
+        const { title, description, status, userId } = req.body;
         if (!title || !status || !userId) return res.status(400).json({ error: "Missing task details" });
 
-        const result = await tasksCollection.insertOne({ title, status, userId });
-        io.emit("taskAdded", { _id: result.insertedId, title, status, userId });
+        const lastTask = await tasksCollection
+            .find({ userId, status })
+            .sort({ order: -1 })
+            .limit(1)
+            .toArray();
 
+        const order = lastTask.length > 0 ? lastTask[0].order + 1 : 0;
+
+        const task = {
+            title,
+            description: description || "", 
+            status,
+            userId,
+            order, 
+            timestamp: new Date().toISOString(),
+        };
+
+        const result = await tasksCollection.insertOne(task);
         res.status(201).json({ message: "Task added successfully", taskId: result.insertedId });
     } catch (error) {
         res.status(500).json({ error: "Failed to add task" });
@@ -139,7 +96,10 @@ app.post("/api/tasks", async (req, res) => {
 
 app.get("/api/tasks", async (req, res) => {
     try {
-        const tasks = await tasksCollection.find().toArray();
+        const { userId } = req.query;
+        if (!userId) return res.status(400).json({ error: "User ID is required" });
+
+        const tasks = await tasksCollection.find({ userId }).sort({ order: 1 }).toArray();
         res.json(tasks);
     } catch (error) {
         res.status(500).json({ error: "Failed to fetch tasks" });
@@ -149,21 +109,54 @@ app.get("/api/tasks", async (req, res) => {
 app.put("/api/tasks/:id", async (req, res) => {
     try {
         const { id } = req.params;
-        const { title, status } = req.body;
+        const { title, description, status } = req.body;
         if (!title || !status) return res.status(400).json({ error: "Title and Status are required" });
 
         const result = await tasksCollection.updateOne(
             { _id: new ObjectId(id) },
-            { $set: { title, status } }
+            { $set: { title, description, status } }
         );
 
         if (result.modifiedCount === 0) return res.status(404).json({ error: "Task not found or no changes detected" });
 
-        io.emit("taskUpdated", { _id: id, title, status });
-
-        res.json({ message: "Task updated successfully" });
+        const updatedTask = await tasksCollection.findOne({ _id: new ObjectId(id) });
+        res.json({ message: "Task updated successfully", updatedTask });
     } catch (error) {
         res.status(500).json({ error: "Failed to update task" });
+    }
+});
+
+app.patch("/api/tasks/:id/status", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status, order } = req.body;
+
+        // Validate required fields
+        if (!status || order === undefined) {
+            return res.status(400).json({ error: "Status and Order are required" });
+        }
+
+        // Validate task ID format
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid task ID" });
+        }
+
+        // Update the task's status and order in the database
+        const result = await tasksCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { status, order } }
+        );
+
+        if (result.modifiedCount === 0) {
+            return res.status(404).json({ error: "Task not found" });
+        }
+
+        // Fetch the updated task
+        const updatedTask = await tasksCollection.findOne({ _id: new ObjectId(id) });
+        res.json({ message: "Task status and order updated successfully", updatedTask });
+    } catch (error) {
+        console.error("Error updating task status and order:", error);
+        res.status(500).json({ error: "Failed to update task status and order" });
     }
 });
 
@@ -174,7 +167,6 @@ app.delete("/api/tasks/:id", async (req, res) => {
         const result = await tasksCollection.deleteOne({ _id: new ObjectId(id) });
         if (result.deletedCount === 0) return res.status(404).json({ error: "Task not found" });
 
-        io.emit("taskDeleted", id);
         res.json({ message: "Task deleted successfully" });
     } catch (error) {
         res.status(500).json({ error: "Failed to delete task" });
@@ -183,12 +175,12 @@ app.delete("/api/tasks/:id", async (req, res) => {
 
 // Server Running Check
 app.get("/", (req, res) => {
-    res.send("TaskManager API is running with WebSockets!");
+    res.send("TaskManager API is running!");
 });
 
 // Start the server AFTER connecting to MongoDB
 connectDB().then(() => {
-    server.listen(port, () => {
+    app.listen(port, () => {
         console.log(`Server running on port ${port}`);
     });
 });
